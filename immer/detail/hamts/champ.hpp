@@ -898,21 +898,53 @@ struct champ
         }
     }
 
+    struct sub_result_mut
+    {
+        using kind_t = sub_result::kind_t;
+        using data_t = sub_result::data_t;
+
+        kind_t kind;
+        data_t data;
+        bool mutate;
+
+        sub_result_mut(bool mutate)
+            : kind{nothing}
+            , mutate{mutate} {};
+        sub_result_mut(T* x, bool mutate)
+            : kind{singleton}
+            , mutate{mutate}
+        {
+            data.singleton = x;
+        };
+        sub_result_mut(node_t* x, bool mutate)
+            : kind{tree}
+            , mutate{mutate}
+        {
+            data.tree = x;
+        };
+    };
+
     template <typename K>
-    sub_result do_sub_mut(
+    sub_result_mut do_sub_mut(
         edit_t e, node_t* node, const K& k, hash_t hash, shift_t shift) const
     {
         if (shift == max_shift<B>) {
             auto fst = node->collisions();
             auto lst = fst + node->collision_count();
-            for (auto cur = fst; cur != lst; ++cur)
-                if (Equal{}(*cur, k))
-                    return node->collision_count() > 2
-                               ? node_t::owned(
-                                     node_t::copy_collision_remove(node, cur),
-                                     e)
-                               : sub_result{fst + (cur == fst)};
-            return {};
+            for (auto cur = fst; cur != lst; ++cur) {
+                if (Equal{}(*cur, k)) {
+                    auto mutate = node->can_mutate(e);
+                    if (node->collision_count() <= 2) {
+                        return sub_result_mut{fst + (cur == fst), mutate};
+                    } else {
+                        auto r = mutate
+                                     ? node_t::move_collision_remove(node, cur)
+                                     : node_t::copy_collision_remove(node, cur);
+                        return {node_t::owned(r, e), mutate};
+                    }
+                }
+            }
+            return {false};
         } else {
             auto idx = (hash & (mask<B> << shift)) >> shift;
             auto bit = bitmap_t{1u} << idx;
@@ -925,31 +957,39 @@ struct champ
                                      : do_sub(child, k, hash, shift + B);
                 switch (result.kind) {
                 case sub_result::nothing:
-                    return {};
+                    return {mutate};
                 case sub_result::singleton:
-                    return node->datamap() == 0 &&
-                                   node->children_count() == 1 && shift > 0
-                               ? result
-                               : node_t::owned_values(
-                                     node_t::copy_inner_replace_inline(
-                                         node,
-                                         bit,
-                                         offset,
-                                         *result.data.singleton),
-                                     e);
+                    if (node->datamap() == 0 && node->children_count() == 1 &&
+                        shift > 0)
+                        return {result.node, mutate};
+                    else {
+                        auto r = mutate ? node_t::copy_inner_replace_inline(
+                                              e,
+                                              node,
+                                              bit,
+                                              offset,
+                                              *result.data.singleton)
+                                        : node_t::copy_inner_replace_inline(
+                                              node,
+                                              bit,
+                                              offset,
+                                              *result.data.singleton);
+                        return {node_t::owned_values(r, e), mutate};
+                    }
                 case sub_result::tree:
                     if (mutate) {
-                        if (child != result.data.tree) {
-                            children[offset] = result.data.tree;
-                            if (child->dec())
-                                node_t::delete_deep_shift(child, shift + B);
-                        }
-                        return node;
+                        children[offset] = result.data.tree;
+                        if (!result.mutate)
+                            child->dec_unsafe();
+                        return {node, true};
                     } else {
                         IMMER_TRY {
-                            auto r = node_t::copy_inner_replace(
-                                node, offset, result.data.tree);
-                            return node_t::owned(r, e);
+                            auto r =
+                                mutate ? node_t::move_inner_replace(
+                                             e, node, offset, result.data.tree)
+                                       : node_t::copy_inner_replace(
+                                             node, offset, result.data.tree);
+                            return {node_t::owned(r, e), mutate};
                         }
                         IMMER_CATCH (...) {
                             node_t::delete_deep_shift(result.data.tree,
@@ -961,20 +1001,28 @@ struct champ
             } else if (node->datamap() & bit) {
                 auto offset = node->data_count(bit);
                 auto val    = node->values() + offset;
+                auto mutate = node->can_mutate(e);
                 if (Equal{}(*val, k)) {
                     auto nv = node->data_count();
                     if (node->nodemap() || nv > 2) {
-                        auto r =
-                            node_t::copy_inner_remove_value(node, bit, offset);
+                        auto r = mutate ? node_t::move_inner_remove_value(
+                                              e, node, bit, offset)
+                                        : node_t::copy_inner_remove_value(
+                                              node, bit, offset);
                         return node_t::owned_values_safe(r, e);
                     } else if (nv == 2) {
-                        return shift > 0 ? sub_result{node->values() + !offset}
-                                         : node_t::owned_values(
-                                               node_t::make_inner_n(
-                                                   0,
-                                                   node->datamap() & ~bit,
-                                                   node->values()[!offset]),
-                                               e);
+                        if (shift > 0)
+                            return {node->values() + !offset, mutate};
+                        else {
+                            auto& v = node->values()[!offset];
+                            auto r =
+                                node_t::make_inner_n(0,
+                                                     node->datamap() & ~bit,
+                                                     mutate ? std::move(v) : v);
+                            if (mutate)
+                                node_t::delete_inner(node);
+                            return {node_t::owned_values(r, e), mutate};
+                        }
                     } else {
                         assert(shift == 0);
                         return empty();

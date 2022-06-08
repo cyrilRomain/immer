@@ -446,6 +446,31 @@ struct node
         return dst;
     }
 
+    static node_t* move_collision_remove(node_t* src, T* v)
+    {
+        IMMER_ASSERT_TAGGED(src->kind() == kind_t::collision);
+        assert(src->collision_count() > 1);
+        auto n    = src->collision_count();
+        auto dst  = make_collision_n(n - 1);
+        auto srcp = src->collisions();
+        auto dstp = dst->collisions();
+        IMMER_TRY {
+            dstp = std::uninitialized_move(srcp, v, dstp);
+            IMMER_TRY {
+                std::uninitialized_move(v + 1, srcp + n, dstp);
+            }
+            IMMER_CATCH (...) {
+                destroy(dst->collisions(), dstp);
+                IMMER_RETHROW;
+            }
+        }
+        IMMER_CATCH (...) {
+            deallocate_collision(dst, n - 1);
+            IMMER_RETHROW;
+        }
+        return dst;
+    }
+
     static node_t* copy_collision_replace(node_t* src, T* pos, T v)
     {
         IMMER_ASSERT_TAGGED(src->kind() == kind_t::collision);
